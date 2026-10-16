@@ -1,0 +1,16 @@
+{
+  "seed": 7,
+  "dt_s": 0.08,
+  "samples_including_initial_pose": 327,
+  "duration_s": 26.080000000000002,
+  "position_rmse_m": 0.04315890563911032,
+  "position_mean_error_m": 0.025206870242071452,
+  "position_max_error_m": 0.6103277807866849,
+  "position_final_error_m": 0.027143673237873686,
+  "heading_rmse_deg": 0.5660365495017037,
+  "heading_mean_absolute_error_deg": 0.30509007864027926,
+  "heading_max_absolute_error_deg": 8.00000000000001,
+  "accepted_measurements": 2331,
+  "rejected_measurements": 600,
+  "rejected_person_measurements": 550
+}
