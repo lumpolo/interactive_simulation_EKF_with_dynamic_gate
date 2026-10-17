@@ -1,0 +1,1189 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "id": "9820cdbd",
+   "metadata": {},
+   "source": [
+    "---\n",
+    "title: \"Localizzazione in ambiente dinamico\"\n",
+    "subtitle: \"Simulazione interattiva con EKF e gate adattativo\"\n",
+    "lang: it\n",
+    "format:\n",
+    "  pdf:\n",
+    "    toc: true\n",
+    "    toc-depth: 2\n",
+    "    number-sections: true\n",
+    "    documentclass: scrartcl\n",
+    "    papersize: a4\n",
+    "    fontsize: 11pt\n",
+    "    geometry:\n",
+    "      - margin=2.3cm\n",
+    "    colorlinks: true\n",
+    "    keep-tex: false\n",
+    "    include-in-header:\n",
+    "      text: |\n",
+    "        \\usepackage{fvextra}\n",
+    "        \\fvset{breaklines=true,breakanywhere=true,fontsize=\\small}\n",
+    "        \\raggedbottom\n",
+    "  html:\n",
+    "    toc: true\n",
+    "    toc-depth: 2\n",
+    "    number-sections: true\n",
+    "    code-fold: true\n",
+    "    code-overflow: wrap\n",
+    "execute:\n",
+    "  echo: false\n",
+    "  warning: false\n",
+    "  error: false\n",
+    "  cache: false\n",
+    "jupyter: python3\n",
+    "---"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "id": "preparazione-dati",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "#| label: preparazione-dati\n",
+    "from pathlib import Path\n",
+    "import ast\n",
+    "import copy\n",
+    "import json\n",
+    "import numpy as np\n",
+    "import pandas as pd\n",
+    "import matplotlib.pyplot as plt\n",
+    "\n",
+    "ROOT = Path.cwd()\n",
+    "ARTIFACTS = ROOT / \"artifacts\"\n",
+    "# Lasciare None per selezionare il CSV con timestamp più recente nel nome.\n",
+    "# Per una sessione specifica, inserire qui il nome completo del CSV.\n",
+    "SESSION_CSV = None\n",
+    "files = sorted(ARTIFACTS.glob(\"lidar_dynamic_gate_log_*.csv\"))\n",
+    "if SESSION_CSV is None:\n",
+    "    if not files:\n",
+    "        raise FileNotFoundError(\"Nessun log di simulazione trovato in artifacts.\")\n",
+    "    csv_path = files[-1]\n",
+    "else:\n",
+    "    csv_path = ARTIFACTS / SESSION_CSV\n",
+    "\n",
+    "df = pd.read_csv(csv_path)\n",
+    "required = [\"frame\", \"time_s\", \"true_x_m\", \"true_y_m\", \"estimated_x_m\",\n",
+    "            \"estimated_y_m\", \"position_error_m\", \"heading_error_deg\",\n",
+    "            \"visible_static_count\", \"visible_dynamic_count\", \"accepted_count\",\n",
+    "            \"rejected_count\", \"rejected_person_count\"]\n",
+    "missing = set(required) - set(df.columns)\n",
+    "if missing or len(df) < 2:\n",
+    "    raise ValueError(f\"Log non valido: colonne mancanti {missing}, campioni {len(df)}\")\n",
+    "if df[required].isna().any().any():\n",
+    "    raise ValueError(\"Il log contiene valori mancanti.\")\n",
+    "if not np.all(np.diff(df[\"time_s\"]) > 0):\n",
+    "    raise ValueError(\"I tempi del log devono essere strettamente crescenti.\")\n",
+    "last = df.iloc[-1]\n",
+    "n = len(df)\n",
+    "duration = float(last[\"time_s\"] - df[\"time_s\"].iloc[0])\n",
+    "dt = float(np.median(np.diff(df[\"time_s\"])))\n",
+    "e = df[\"position_error_m\"].to_numpy()\n",
+    "a = df[\"heading_error_deg\"].to_numpy()\n",
+    "rmse = float(np.sqrt(np.mean(e**2)))\n",
+    "mean_error = float(np.mean(e))\n",
+    "max_error = float(np.max(e))\n",
+    "final_error = float(e[-1])\n",
+    "heading_rmse = float(np.sqrt(np.mean(a**2)))\n",
+    "initial_error = float(e[0])\n",
+    "post_rmse = float(np.sqrt(np.mean(e[1:]**2)))\n",
+    "post_max = float(np.max(e[1:]))\n",
+    "static_total = int(df[\"visible_static_count\"].sum())\n",
+    "dynamic_total = int(df[\"visible_dynamic_count\"].sum())\n",
+    "accepted = int(last[\"accepted_count\"])\n",
+    "rejected = int(last[\"rejected_count\"])\n",
+    "dynamic_rejected = int(last[\"rejected_person_count\"])\n",
+    "dynamic_accepted = dynamic_total - dynamic_rejected\n",
+    "static_rejected = rejected - dynamic_rejected\n",
+    "static_accepted = static_total - static_rejected\n",
+    "if min(dynamic_accepted, dynamic_rejected, static_accepted, static_rejected) < 0:\n",
+    "    raise ValueError(\"Conteggi di classificazione incoerenti.\")\n",
+    "if accepted != static_accepted + dynamic_accepted:\n",
+    "    raise ValueError(\"Misure generate e contatori cumulativi non coincidono.\")\n",
+    "if accepted + rejected != static_total + dynamic_total:\n",
+    "    raise ValueError(\"Numero complessivo di decisioni non coerente.\")\n",
+    "\n",
+    "def fmt(value, digits=4):\n",
+    "    return f\"{value:.{digits}f}\".replace(\".\", \",\")\n",
+    "\n",
+    "def percent(num, den):\n",
+    "    return \"non definita (denominatore nullo)\" if den == 0 else fmt(100*num/den, 2) + \"%\"\n",
+    "\n",
+    "# Il JSON deve appartenere alla medesima sessione del CSV.\n",
+    "suffix = csv_path.name.removeprefix(\"lidar_dynamic_gate_log_\").removesuffix(\".csv\")\n",
+    "summary_path = ARTIFACTS / f\"lidar_dynamic_gate_summary_{suffix}.json\"\n",
+    "summary = json.loads(summary_path.read_text(encoding=\"utf-8\")) if summary_path.exists() else {}\n",
+    "if summary and int(summary[\"samples_including_initial_pose\"]) != n:\n",
+    "    raise ValueError(\"CSV e riepilogo JSON hanno un numero di campioni differente.\")\n",
+    "seed_text = str(summary.get(\"seed\", \"non registrato\"))\n",
+    "\n",
+    "# Lettura statica dello script: non avvia la GUI e non esegue la simulazione.\n",
+    "source_path = ROOT / \"interactive_lidar_dynamic_gate.py\"\n",
+    "source = source_path.read_text(encoding=\"utf-8\")\n",
+    "tree = ast.parse(source)\n",
+    "\n",
+    "def find_node(name, owner=None):\n",
+    "    nodes = tree.body if owner is None else next(\n",
+    "        x for x in tree.body if isinstance(x, ast.ClassDef) and x.name == owner).body\n",
+    "    return next(x for x in nodes if isinstance(x, (ast.FunctionDef, ast.ClassDef)) and x.name == name)\n",
+    "\n",
+    "def show_code(name, owner=None):\n",
+    "    node = copy.deepcopy(find_node(name, owner))\n",
+    "    # Rimuove anche eventuali stringhe-commento interne, senza cambiare le istruzioni.\n",
+    "    class RemoveStringComments(ast.NodeTransformer):\n",
+    "        def visit_Expr(self, item):\n",
+    "            if isinstance(item.value, ast.Constant) and isinstance(item.value.value, str):\n",
+    "                return None\n",
+    "            return self.generic_visit(item)\n",
+    "    node = RemoveStringComments().visit(node)\n",
+    "    print(\"```python\\n\" + ast.unparse(node) + \"\\n```\\n\")\n",
+    "\n",
+    "precision_text = percent(dynamic_rejected, rejected)\n",
+    "recall_text = percent(dynamic_rejected, dynamic_total)\n",
+    "static_reject_text = percent(static_rejected, static_total)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "930d03e5",
+   "metadata": {
+    "user_expressions": [
+     {
+      "expression": "csv_path.name",
+      "result": {
+       "data": {
+        "text/plain": "'lidar_dynamic_gate_log_20261016_134750_809690.csv'"
+       },
+       "metadata": {},
+       "status": "ok"
+      }
+     },
+     {
+      "expression": "fmt(duration, 2)",
+      "result": {
+       "data": {
+        "text/plain": "'26,08'"
+       },
+       "metadata": {},
+       "status": "ok"
+      }
+     },
+     {
+      "expression": "fmt(dt, 2)",
+      "result": {
+       "data": {
+        "text/plain": "'0,08'"
+       },
+       "metadata": {},
+       "status": "ok"
+      }
+     },
+     {
+      "expression": "n",
+      "result": {
+       "data": {
+        "text/plain": "327"
+       },
+       "metadata": {},
+       "status": "ok"
+      }
+     },
+     {
+      "expression": "seed_text",
+      "result": {
+       "data": {
+        "text/plain": "'7'"
+       },
+       "metadata": {},
+       "status": "ok"
+      }
+     },
+     {
+      "expression": "fmt(initial_error)",
+      "result": {
+       "data": {
+        "text/plain": "'0,6103'"
+       },
+       "metadata": {},
+       "status": "ok"
+      }
+     },
+     {
+      "expression": "fmt(rmse)",
+      "result": {
+       "data": {
+        "text/plain": "'0,0432'"
+       },
+       "metadata": {},
+       "status": "ok"
+      }
+     },
+     {
+      "expression": "fmt(mean_error)",
+      "result": {
+       "data": {
+        "text/plain": "'0,0252'"
+       },
+       "metadata": {},
+       "status": "ok"
+      }
+     },
+     {
+      "expression": "fmt(max_error)",
+      "result": {
+       "data": {
+        "text/plain": "'0,6103'"
+       },
+       "metadata": {},
+       "status": "ok"
+      }
+     },
+     {
+      "expression": "fmt(final_error)",
+      "result": {
+       "data": {
+        "text/plain": "'0,0271'"
+       },
+       "metadata": {},
+       "status": "ok"
+      }
+     },
+     {
+      "expression": "fmt(heading_rmse, 3)",
+      "result": {
+       "data": {
+        "text/plain": "'0,566'"
+       },
+       "metadata": {},
+       "status": "ok"
+      }
+     },
+     {
+      "expression": "fmt(post_rmse)",
+      "result": {
+       "data": {
+        "text/plain": "'0,0269'"
+       },
+       "metadata": {},
+       "status": "ok"
+      }
+     },
+     {
+      "expression": "fmt(post_max)",
+      "result": {
+       "data": {
+        "text/plain": "'0,0741'"
+       },
+       "metadata": {},
+       "status": "ok"
+      }
+     }
+    ]
+   },
+   "source": [
+    "# Obiettivo e impostazione del progetto\n",
+    "\n",
+    "Il progetto realizza una simulazione interattiva di localizzazione di un robot in una mappa nota contenente landmark statici e persone mobili. Il robot viene guidato mediante tastiera; un Extended Kalman Filter (EKF) ne stima la posizione e l’orientamento utilizzando odometria rumorosa e misure Lidar simulate di distanza e angolo.\n",
+    "\n",
+    "Per evitare che osservazioni di persone mobili producano correzioni errate, ogni misura viene confrontata con la mappa statica. Un controllo geometrico e un gate adattativo sull’innovazione determinano se utilizzarla nell’EKF oppure scartarla. Una misura rifiutata è incompatibile con la mappa: questo non costituisce, da solo, una prova del movimento dell’oggetto.\n",
+    "\n",
+    "La valutazione riguarda il comportamento del sistema con gate dinamico durante una sessione manuale, senza confronti con altre strategie.\n",
+    "\n",
+    "# Ambiente e sensore simulati\n",
+    "\n",
+    "## Mappa statica e persone mobili\n",
+    "\n",
+    "La mappa contiene punti di riferimento noti disposti lungo due file orizzontali e in posizioni isolate. La disposizione effettivamente implementata è riportata nell’appendice, estratta automaticamente dalla funzione `_make_static_objects` dello script.\n",
+    "\n",
+    "Le posizioni delle persone sono inizializzate con distribuzione uniforme nell’intervallo $[-0.65W,0.65W]$ lungo ciascun asse, dove $W$ è la semi-estensione del mondo. Le due componenti della velocità iniziale sono estratte indipendentemente da una distribuzione normale. Il secondo argomento di `rng.normal` rappresenta la deviazione standard, non la varianza; i valori utilizzati sono consultabili nell’estratto di inizializzazione in appendice.\n",
+    "\n",
+    "A ogni passo si applica:\n",
+    "\n",
+    "$$\n",
+    "p_{k+1}=p_k+v_k\\Delta t.\n",
+    "$$\n",
+    "\n",
+    "Al superamento dei limiti $[-0.8W,0.8W]$ viene invertita la componente della velocità relativa all’asse interessato; la posizione viene ricondotta entro il limite tramite clipping.\n",
+    "\n",
+    "## Misure Lidar\n",
+    "\n",
+    "Il sensore è modellato a livello di oggetti puntiformi: produce misure rumorose per i punti entro la portata, senza simulare una scansione laser completa, la segmentazione o le occlusioni. Per un landmark $l=(l_x,l_y)^T$ e una posa $x=(x,y,\\theta)^T$:\n",
+    "\n",
+    "$$\n",
+    "\\begin{aligned}\n",
+    "\\Delta_x &= l_x-x, & \\Delta_y &= l_y-y,\\\\\n",
+    "r &= \\sqrt{\\Delta_x^2+\\Delta_y^2}, &\n",
+    "\\beta &= \\operatorname{wrap}\\bigl(\\operatorname{atan2}(\\Delta_y,\\Delta_x)-\\theta\\bigr).\n",
+    "\\end{aligned}\n",
+    "$$\n",
+    "\n",
+    "Il vettore di misura è $z=(r,\\beta)^T$. Alla distanza e all’angolo si aggiungono rumori gaussiani indipendenti, con covarianza:\n",
+    "\n",
+    "$$\n",
+    "R=\\operatorname{diag}(\\sigma_r^2,\\sigma_\\beta^2).\n",
+    "$$\n",
+    "\n",
+    "La funzione `wrap_angle` riporta gli angoli nell’intervallo $[-\\pi,\\pi)$.\n",
+    "\n",
+    "# Modello del robot e filtro EKF\n",
+    "\n",
+    "## Stato e modello cinematico\n",
+    "\n",
+    "Lo stato stimato è $x_k=(x_k,y_k,\\theta_k)^T$. Il modello uniciclo discretizzato è:\n",
+    "\n",
+    "$$\n",
+    "\\begin{aligned}\n",
+    "x_{k+1}&=x_k+v_k\\cos(\\theta_k)\\Delta t,\\\\\n",
+    "y_{k+1}&=y_k+v_k\\sin(\\theta_k)\\Delta t,\\\\\n",
+    "\\theta_{k+1}&=\\operatorname{wrap}(\\theta_k+\\omega_k\\Delta t).\n",
+    "\\end{aligned}\n",
+    "$$\n",
+    "\n",
+    "Il moto reale utilizza i comandi impartiti dalla tastiera; all’EKF vengono forniti comandi perturbati da rumore per rappresentare errori di odometria. La posizione reale viene inoltre limitata ai confini del mondo simulato tramite clipping.\n",
+    "\n",
+    "Il filtro è inizializzato con uno scostamento intenzionale dalla posa reale e con una covarianza diagonale. Le condizioni iniziali della sessione analizzata sono ricavate dal primo campione del log, non assunte uguali a quelle di altre prove.\n",
+    "\n",
+    "## Predizione\n",
+    "\n",
+    "La predizione della posa segue il modello cinematico. La covarianza viene propagata mediante:\n",
+    "\n",
+    "$$\n",
+    "P_{k+1}^-=F_kP_k^+F_k^T+Q,\n",
+    "$$\n",
+    "\n",
+    "con:\n",
+    "\n",
+    "$$\n",
+    "F_k=\\begin{pmatrix}\n",
+    "1&0&-v_k\\sin(\\theta_k)\\Delta t\\\\\n",
+    "0&1&v_k\\cos(\\theta_k)\\Delta t\\\\\n",
+    "0&0&1\n",
+    "\\end{pmatrix},\n",
+    "\\qquad\n",
+    "Q=\\operatorname{diag}(\\sigma_{xy}^2,\\sigma_{xy}^2,\\sigma_\\theta^2).\n",
+    "$$\n",
+    "\n",
+    "$Q$ rappresenta la covarianza del rumore di processo per passo, adottata nell’implementazione; non coincide con il rumore casuale aggiunto ai comandi.\n",
+    "\n",
+    "## Modello di osservazione e correzione\n",
+    "\n",
+    "Il modello $h(x,l)$ restituisce distanza e angolo previsti. Per $q=\\Delta_x^2+\\Delta_y^2$ e $r=\\sqrt q$, il suo Jacobiano rispetto alla posa è:\n",
+    "\n",
+    "$$\n",
+    "H=\\begin{pmatrix}\n",
+    "-\\Delta_x/r&-\\Delta_y/r&0\\\\\n",
+    "\\Delta_y/q&-\\Delta_x/q&-1\n",
+    "\\end{pmatrix}.\n",
+    "$$\n",
+    "\n",
+    "Nel codice si impone un piccolo limite inferiore a $q$ per evitare divisioni per zero. Per una misura accettata, indicando con $-$ e $+$ le quantità prima e dopo la correzione:\n",
+    "\n",
+    "$$\n",
+    "\\begin{aligned}\n",
+    "\\nu_k&=z_k-h(\\hat{x}_k^-),\\\\\n",
+    "S_k&=H_kP_k^-H_k^T+R,\\\\\n",
+    "K_k&=P_k^-H_k^TS_k^{-1},\\\\\n",
+    "\\hat{x}_k^+&=\\hat{x}_k^-+K_k\\nu_k.\n",
+    "\\end{aligned}\n",
+    "$$\n",
+    "\n",
+    "La componente angolare dell’innovazione e l’orientamento corretto vengono normalizzati. La covarianza viene aggiornata con la forma di Joseph:\n",
+    "\n",
+    "$$\n",
+    "P_k^+=(I-K_kH_k)P_k^-(I-K_kH_k)^T+K_kRK_k^T.\n",
+    "$$\n",
+    "\n",
+    "Questa formulazione favorisce la stabilità numerica. $S_k$ è la covarianza dell’innovazione e $K_k$ il guadagno di Kalman. Le misure accettate vengono elaborate sequenzialmente.\n",
+    "\n",
+    "# Associazione delle misure e gate dinamico\n",
+    "\n",
+    "## Controllo geometrico\n",
+    "\n",
+    "La misura viene convertita nel riferimento locale del robot:\n",
+    "\n",
+    "$$\n",
+    "p_{\\mathrm{obs}}=\\begin{pmatrix}r\\cos\\beta\\\\r\\sin\\beta\\end{pmatrix}.\n",
+    "$$\n",
+    "\n",
+    "Per ciascun landmark si predice la posizione relativa:\n",
+    "\n",
+    "$$\n",
+    "p_{\\mathrm{exp},i}=R(\\hat\\theta^-)^T(l_i-\\hat p^-),\\qquad\n",
+    "R(\\theta)^T=\\begin{pmatrix}\\cos\\theta&\\sin\\theta\\\\-\\sin\\theta&\\cos\\theta\\end{pmatrix}.\n",
+    "$$\n",
+    "\n",
+    "Il candidato è quello che minimizza $e_{\\mathrm{rel},i}=\\|p_{\\mathrm{obs}}-p_{\\mathrm{exp},i}\\|$. Il controllo geometrico richiede che tale errore sia inferiore a `association_gate`.\n",
+    "\n",
+    "## Controllo sull’innovazione\n",
+    "\n",
+    "Per il candidato selezionato si verifica anche:\n",
+    "\n",
+    "$$\n",
+    "d^2=\\nu^TS^{-1}\\nu<g_{\\mathrm{dyn}}.\n",
+    "$$\n",
+    "\n",
+    "La soglia adattativa è:\n",
+    "\n",
+    "$$\n",
+    "g_{\\mathrm{dyn}}=\\operatorname{clip}\\left(\n",
+    " g_0+c_u\\sqrt{\\max(\\det S,0)}+c_v|\\tilde v|-c_rr,\n",
+    " g_{\\min},g_{\\max}\\right),\n",
+    "$$\n",
+    "\n",
+    "dove $\\tilde v$ è il comando lineare rumoroso fornito al filtro. I parametri effettivi sono quelli della funzione e della configurazione riportate in appendice. A parità degli altri termini, l’incertezza e la velocità ampliano la soglia, mentre la distanza la restringe, entro i limiti del clipping. La soglia è euristica: l’adattamento non corrisponde a un livello di confidenza statistico costante.\n",
+    "\n",
+    "La misura viene accettata soltanto se supera entrambi i controlli. Il termine “dinamico” riferito al gate indica che la soglia si adatta alle condizioni operative; il metodo non stima esplicitamente la velocità di ciascun oggetto.\n",
+    "\n",
+    "L’associazione geometrica utilizza la posa predetta all’inizio del fotogramma. Le distanze di innovazione e le relative covarianze sono invece calcolate con lo stato corrente dell’EKF, che può includere aggiornamenti dovuti a misure già accettate nello stesso fotogramma.\n",
+    "\n",
+    "L’etichetta `source`, nota al simulatore, serve esclusivamente a valutare i rifiuti e aggiornare i contatori. Non viene utilizzata per decidere l’accettazione della misura.\n",
+    "\n",
+    "# Sessione analizzata e risultati\n",
+    "\n",
+    "## Provenienza dei dati e riproducibilità\n",
+    "\n",
+    "Il report seleziona automaticamente il CSV con timestamp più recente nel nome tra quelli presenti in `artifacts`. Per scegliere una sessione specifica si può impostare `SESSION_CSV` nel primo blocco Python del QMD. Tutti gli indicatori seguenti vengono ricalcolati dal CSV; l’eventuale JSON viene letto soltanto se ha lo stesso identificativo di sessione.\n",
+    "\n",
+    "**Log analizzato:** `{python} csv_path.name`.\n",
+    "\n",
+    "| Parametro della registrazione | Valore |\n",
+    "|:--|--:|\n",
+    "| Tempo simulato [s] | `{python} fmt(duration, 2)` |\n",
+    "| Passo temporale [s] | `{python} fmt(dt, 2)` |\n",
+    "| Campioni, inclusa la posa iniziale | `{python} n` |\n",
+    "| Seed registrato nel riepilogo | `{python} seed_text` |\n",
+    "\n",
+    "La guida è manuale: il seed non rende riproducibile da solo la sequenza di comandi. Il log non registra gli eventi di reset del filtro; se è stato usato il tasto `R`, le metriche includono i campioni prima e dopo il reset. Per una prova senza interventi sulla stima occorre evitare tale comando.\n",
+    "\n",
+    "## Localizzazione\n",
+    "\n",
+    "L’errore di posizione e il relativo RMSE sono definiti come:\n",
+    "\n",
+    "$$\n",
+    "e_k=\\sqrt{(\\hat x_k-x_k)^2+(\\hat y_k-y_k)^2},\\qquad\n",
+    "\\mathrm{RMSE}_{\\mathrm{pos}}=\\sqrt{\\frac1N\\sum_{k=1}^N e_k^2}.\n",
+    "$$\n",
+    "\n",
+    "L’errore angolare è normalizzato in $[-\\pi,\\pi)$ e convertito in gradi per la presentazione.\n",
+    "\n",
+    "| Indicatore | Valore |\n",
+    "|:--|--:|\n",
+    "| Errore iniziale di posizione [m] | `{python} fmt(initial_error)` |\n",
+    "| RMSE di posizione, tutti i campioni [m] | `{python} fmt(rmse)` |\n",
+    "| Errore medio di posizione [m] | `{python} fmt(mean_error)` |\n",
+    "| Errore massimo di posizione [m] | `{python} fmt(max_error)` |\n",
+    "| Errore finale di posizione [m] | `{python} fmt(final_error)` |\n",
+    "| RMSE di orientamento [gradi] | `{python} fmt(heading_rmse, 3)` |\n",
+    "| RMSE di posizione senza il campione iniziale [m] | `{python} fmt(post_rmse)` |\n",
+    "| Errore massimo senza il campione iniziale [m] | `{python} fmt(post_max)` |\n",
+    "\n",
+    ": Errori calcolati dalla sessione selezionata. {#tbl-errori}\n",
+    "\n",
+    "Gli indicatori principali includono lo scostamento iniziale imposto al filtro. Gli ultimi due indicatori escludono soltanto il primo campione: non rappresentano una selezione automatica del regime stazionario."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "id": "fig-errori",
+   "metadata": {
+    "fig-height": 4.4,
+    "fig-width": 7
+   },
+   "outputs": [
+    {
+     "data": {
+      "application/pdf": "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NyAvYSAxMDAgL2QgL2UgMTAzIC9nIDEwNSAvaSAxMDgKL2wgL20gL24gL28gL3AgMTE0IC9yIC9zIC90IC91IDEyMiAveiBdCj4+Ci9XaWR0aHMgMTMgMCBSID4+CmVuZG9iagoxNCAwIG9iago8PCAvVHlwZSAvRm9udERlc2NyaXB0b3IgL0ZvbnROYW1lIC9CTVFRRFYrRGVqYVZ1U2FucyAvRmxhZ3MgMzIKL0ZvbnRCQm94IFsgLTEwMjEgLTQ2MyAxNzk0IDEyMzMgXSAvQXNjZW50IDkyOSAvRGVzY2VudCAtMjM2IC9DYXBIZWlnaHQgMAovWEhlaWdodCAwIC9JdGFsaWNBbmdsZSAwIC9TdGVtViAwIC9NYXhXaWR0aCAxMzQyID4+CmVuZG9iagoxMyAwIG9iagpbIDYwMCA2MDAgNjAwIDYwMCA2MDAgNjAwIDYwMCA2MDAgNjAwIDYwMCA2MDAgNjAwIDYwMCA2MDAgNjAwIDYwMCA2MDAgNjAwCjYwMCA2MDAgNjAwIDYwMCA2MDAgNjAwIDYwMCA2MDAgNjAwIDYwMCA2MDAgNjAwIDYwMCA2MDAgMzE4IDQwMSA0NjAgODM4IDYzNgo5NTAgNzgwIDI3NSAzOTAgMzkwIDUwMCA4MzggMzE4IDM2MSAzMTggMzM3IDYzNiA2MzYgNjM2IDYzNiA2MzYgNjM2IDYzNiA2MzYKNjM2IDYzNiAzMzcgMzM3IDgzOCA4MzggODM4IDUzMSAxMDAwIDY4NCA2ODYgNjk4IDc3MCA2MzIgNTc1IDc3NSA3NTIgMjk1CjI5NSA2NTYgNTU3IDg2MyA3NDggNzg3IDYwMyA3ODcgNjk1IDYzNSA2MTEgNzMyIDY4NCA5ODkgNjg1IDYxMSA2ODUgMzkwIDMzNwozOTAgODM4IDUwMCA1MDAgNjEzIDYzNSA1NTAgNjM1IDYxNSAzNTIgNjM1IDYzNCAyNzggMjc4IDU3OSAyNzggOTc0IDYzNCA2MTIKNjM1IDYzNSA0MTEgNTIxIDM5MiA2MzQgNTkyIDgxOCA1OTIgNTkyIDUyNSA2MzYgMzM3IDYzNiA4MzggNjAwIDYzNiA2MDAgMzE4CjM1MiA1MTggMTAwMCA1MDAgNTAwIDUwMCAxMzQyIDYzNSA0MDAgMTA3MCA2MDAgNjg1IDYwMCA2MDAgMzE4IDMxOCA1MTggNTE4CjU5MCA1MDAgMTAwMCA1MDAgMTAwMCA1MjEgNDAwIDEwMjMgNjAwIDUyNSA2MTEgMzE4IDQwMSA2MzYgNjM2IDYzNiA2MzYgMzM3CjUwMCA1MDAgMTAwMCA0NzEgNjEyIDgzOCAzNjEgMTAwMCA1MDAgNTAwIDgzOCA0MDEgNDAxIDUwMCA2MzYgNjM2IDMxOCA1MDAKNDAxIDQ3MSA2MTIgOTY5IDk2OSA5NjkgNTMxIDY4NCA2ODQgNjg0IDY4NCA2ODQgNjg0IDk3NCA2OTggNjMyIDYzMiA2MzIgNjMyCjI5NSAyOTUgMjk1IDI5NSA3NzUgNzQ4IDc4NyA3ODcgNzg3IDc4NyA3ODcgODM4IDc4NyA3MzIgNzMyIDczMiA3MzIgNjExIDYwNQo2MzAgNjEzIDYxMyA2MTMgNjEzIDYxMyA2MTMgOTgyIDU1MCA2MTUgNjE1IDYxNSA2MTUgMjc4IDI3OCAyNzggMjc4IDYxMiA2MzQKNjEyIDYxMiA2MTIgNjEyIDYxMiA4MzggNjEyIDYzNCA2MzQgNjM0IDYzNCA1OTIgNjM1IDU5MiBdCmVuZG9iagoxNiAwIG9iago8PCAvRSAxNyAwIFIgL1QgMTggMCBSIC9hIDE5IDAgUiAvYnJhY2tldGxlZnQgMjAgMCBSIC9icmFja2V0cmlnaHQgMjEgMCBSCi9kIDIyIDAgUiAvZSAyMyAwIFIgL2VpZ2h0IDI0IDAgUiAvZml2ZSAyNSAwIFIgL2ZvdXIgMjYgMCBSIC9nIDI3IDAgUgovaSAyOCAwIFIgL2wgMjkgMCBSIC9tIDMwIDAgUiAvbiAzMSAwIFIgL28gMzIgMCBSIC9vbmUgMzMgMCBSIC9wIDM0IDAgUgovcGVyaW9kIDM1IDAgUiAvciAzNiAwIFIgL3MgMzcgMCBSIC9zaXggMzggMCBSIC9zcGFjZSAzOSAwIFIgL3QgNDAgMCBSCi90d28gNDEgMCBSIC91IDQyIDAgUiAveiA0MyAwIFIgL3plcm8gNDQgMCBSID4+CmVuZG9iagozIDAgb2JqCjw8IC9GMSAxNSAwIFIgPj4KZW5kb2JqCjQgMCBvYmoKPDwgL0ExIDw8IC9UeXBlIC9FeHRHU3RhdGUgL0NBIDAgL2NhIDEgPj4KL0EyIDw8IC9UeXBlIC9FeHRHU3RhdGUgL0NBIDAuMjUgL2NhIDEgPj4KL0EzIDw8IC9UeXBlIC9FeHRHU3RhdGUgL0NBIDEgL2NhIDEgPj4gPj4KZW5kb2JqCjUgMCBvYmoKPDwgPj4KZW5kb2JqCjYgMCBvYmoKPDwgPj4KZW5kb2JqCjcgMCBvYmoKPDwgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFsgMTEgMCBSIF0gL0NvdW50IDEgPj4KZW5kb2JqCjQ1IDAgb2JqCjw8IC9DcmVhdG9yIChNYXRwbG90bGliIHYzLjEwLjksIGh0dHBzOi8vbWF0cGxvdGxpYi5vcmcpCi9Qcm9kdWNlciAoTWF0cGxvdGxpYiBwZGYgYmFja2VuZCB2My4xMC45KQovQ3JlYXRpb25EYXRlIChEOjIwMjYxMDE2MTYwMTAyKzAyJzAwJykgPj4KZW5kb2JqCnhyZWYKMCA0NgowMDAwMDAwMDAwIDY1NTM1IGYgCjAwMDAwMDAwMTYgMDAwMDAgbiAKMDAwMDAxNzI0OCAwMDAwMCBuIAowMDAwMDE3MDEyIDAwMDAwIG4gCjAwMDAwMTcwNDQgMDAwMDAgbiAKMDAwMDAxNzE4NSAwMDAwMCBuIAowMDAwMDE3MjA2IDAwMDAwIG4gCjAwMDAwMTcyMjcgMDAwMDAgbiAKMDAwMDAwMDA2NSAwMDAwMCBuIAowMDAwMDAwMzQyIDAwMDAwIG4gCjAwMDAwMDc4ODcgMDAwMDAgbiAKMDAwMDAwMDIwOCAwMDAwMCBuIAowMDAwMDA3ODY2IDAwMDAwIG4gCjAwMDAwMTU2MDggMDAwMDAgbiAKMDAwMDAxNTQwMSAwMDAwMCBuIAowMDAwMDE0OTA3IDAwMDAwIG4gCjAwMDAwMTY2NjEgMDAwMDAgbiAKMDAwMDAwNzkwNyAwMDAwMCBuIAowMDAwMDA4MDYwIDAwMDAwIG4gCjAwMDAwMDgxOTggMDAwMDAgbiAKMDAwMDAwODU3OCAwMDAwMCBuIAowMDAwMDA4NzIzIDAwMDAwIG4gCjAwMDAwMDg4NjQgMDAwMDAgbiAKMDAwMDAwOTE2OCAwMDAwMCBuIAowMDAwMDA5NDkwIDAwMDAwIG4gCjAwMDAwMDk5NTggMDAwMDAgbiAKMDAwMDAxMDI4MCAwMDAwMCBuIAowMDAwMDEwNDQ2IDAwMDAwIG4gCjAwMDAwMTA4NjAgMDAwMDAgbiAKMDAwMDAxMTAwNCAwMDAwMCBuIAowMDAwMDExMTIzIDAwMDAwIG4gCjAwMDAwMTE0NTQgMDAwMDAgbiAKMDAwMDAxMTY5MCAwMDAwMCBuIAowMDAwMDExOTgxIDAwMDAwIG4gCjAwMDAwMTIxMzYgMDAwMDAgbiAKMDAwMDAxMjQ0OCAwMDAwMCBuIAowMDAwMDEyNTcxIDAwMDAwIG4gCjAwMDAwMTI4MDQgMDAwMDAgbiAKMDAwMDAxMzIxMSAwMDAwMCBuIAowMDAwMDEzNjA0IDAwMDAwIG4gCjAwMDAwMTM2OTQgMDAwMDAgbiAKMDAwMDAxMzkwMCAwMDAwMCBuIAowMDAwMDE0MjI0IDAwMDAwIG4gCjAwMDAwMTQ0NzEgMDAwMDAgbiAKMDAwMDAxNDYxOSAwMDAwMCBuIAowMDAwMDE3MzA4IDAwMDAwIG4gCnRyYWlsZXIKPDwgL1NpemUgNDYgL1Jvb3QgMSAwIFIgL0luZm8gNDUgMCBSID4+CnN0YXJ0eHJlZgoxNzQ2NwolJUVPRgo=",
+      "text/plain": [
+       "<Figure size 2100x1320 with 2 Axes>"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "#| label: fig-errori\n",
+    "#| fig-cap: Errori di posizione e orientamento durante la sessione selezionata.\n",
+    "#| fig-pos: htbp\n",
+    "plt.rcParams.update({\"font.size\": 10})\n",
+    "fig, axes = plt.subplots(2, 1, sharex=True, figsize=(7, 4.4), layout=\"constrained\")\n",
+    "axes[0].plot(df[\"time_s\"], e, color=\"#0072B2\", linewidth=1.2)\n",
+    "axes[0].set_ylabel(\"Errore di posizione [m]\")\n",
+    "axes[1].plot(df[\"time_s\"], a, color=\"#D55E00\", linewidth=1.2)\n",
+    "axes[1].set_ylabel(\"Errore angolare [gradi]\")\n",
+    "axes[1].set_xlabel(\"Tempo simulato [s]\")\n",
+    "for ax in axes:\n",
+    "    ax.grid(alpha=0.25)\n",
+    "plt.show()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "id": "fig-traiettoria",
+   "metadata": {
+    "fig-height": 4.5,
+    "fig-width": 6
+   },
+   "outputs": [
+    {
+     "data": {
+      "application/pdf": "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bGUgMCAvU3RlbVYgMCAvTWF4V2lkdGggMTM0MiA+PgplbmRvYmoKMTMgMCBvYmoKWyA2MDAgNjAwIDYwMCA2MDAgNjAwIDYwMCA2MDAgNjAwIDYwMCA2MDAgNjAwIDYwMCA2MDAgNjAwIDYwMCA2MDAgNjAwIDYwMAo2MDAgNjAwIDYwMCA2MDAgNjAwIDYwMCA2MDAgNjAwIDYwMCA2MDAgNjAwIDYwMCA2MDAgNjAwIDMxOCA0MDEgNDYwIDgzOCA2MzYKOTUwIDc4MCAyNzUgMzkwIDM5MCA1MDAgODM4IDMxOCAzNjEgMzE4IDMzNyA2MzYgNjM2IDYzNiA2MzYgNjM2IDYzNiA2MzYgNjM2CjYzNiA2MzYgMzM3IDMzNyA4MzggODM4IDgzOCA1MzEgMTAwMCA2ODQgNjg2IDY5OCA3NzAgNjMyIDU3NSA3NzUgNzUyIDI5NQoyOTUgNjU2IDU1NyA4NjMgNzQ4IDc4NyA2MDMgNzg3IDY5NSA2MzUgNjExIDczMiA2ODQgOTg5IDY4NSA2MTEgNjg1IDM5MCAzMzcKMzkwIDgzOCA1MDAgNTAwIDYxMyA2MzUgNTUwIDYzNSA2MTUgMzUyIDYzNSA2MzQgMjc4IDI3OCA1NzkgMjc4IDk3NCA2MzQgNjEyCjYzNSA2MzUgNDExIDUyMSAzOTIgNjM0IDU5MiA4MTggNTkyIDU5MiA1MjUgNjM2IDMzNyA2MzYgODM4IDYwMCA2MzYgNjAwIDMxOAozNTIgNTE4IDEwMDAgNTAwIDUwMCA1MDAgMTM0MiA2MzUgNDAwIDEwNzAgNjAwIDY4NSA2MDAgNjAwIDMxOCAzMTggNTE4IDUxOAo1OTAgNTAwIDEwMDAgNTAwIDEwMDAgNTIxIDQwMCAxMDIzIDYwMCA1MjUgNjExIDMxOCA0MDEgNjM2IDYzNiA2MzYgNjM2IDMzNwo1MDAgNTAwIDEwMDAgNDcxIDYxMiA4MzggMzYxIDEwMDAgNTAwIDUwMCA4MzggNDAxIDQwMSA1MDAgNjM2IDYzNiAzMTggNTAwCjQwMSA0NzEgNjEyIDk2OSA5NjkgOTY5IDUzMSA2ODQgNjg0IDY4NCA2ODQgNjg0IDY4NCA5NzQgNjk4IDYzMiA2MzIgNjMyIDYzMgoyOTUgMjk1IDI5NSAyOTUgNzc1IDc0OCA3ODcgNzg3IDc4NyA3ODcgNzg3IDgzOCA3ODcgNzMyIDczMiA3MzIgNzMyIDYxMSA2MDUKNjMwIDYxMyA2MTMgNjEzIDYxMyA2MTMgNjEzIDk4MiA1NTAgNjE1IDYxNSA2MTUgNjE1IDI3OCAyNzggMjc4IDI3OCA2MTIgNjM0CjYxMiA2MTIgNjEyIDYxMiA2MTIgODM4IDYxMiA2MzQgNjM0IDYzNCA2MzQgNTkyIDYzNSA1OTIgXQplbmRvYmoKMTYgMCBvYmoKPDwgL0UgMTcgMCBSIC9GIDE4IDAgUiAvSyAxOSAwIFIgL1AgMjAgMCBSIC9UIDIxIDAgUiAvYSAyMiAwIFIKL2JyYWNrZXRsZWZ0IDIzIDAgUiAvYnJhY2tldHJpZ2h0IDI0IDAgUiAvZSAyNSAwIFIgL2ZpdmUgMjYgMCBSCi9mb3VyIDI3IDAgUiAvaSAyOCAwIFIgL2wgMjkgMCBSIC9tIDMwIDAgUiAvbiAzMiAwIFIgL28gMzMgMCBSIC9vbmUgMzQgMCBSCi9wZXJpb2QgMzUgMCBSIC9yIDM2IDAgUiAvc2V2ZW4gMzcgMCBSIC9zaXggMzggMCBSIC9zcGFjZSAzOSAwIFIgL3QgNDAgMCBSCi90d28gNDEgMCBSIC94IDQyIDAgUiAveSA0MyAwIFIgL3ogNDQgMCBSIC96ZXJvIDQ1IDAgUiA+PgplbmRvYmoKMyAwIG9iago8PCAvRjEgMTUgMCBSID4+CmVuZG9iago0IDAgb2JqCjw8IC9BMSA8PCAvVHlwZSAvRXh0R1N0YXRlIC9DQSAwIC9jYSAxID4+Ci9BMiA8PCAvVHlwZSAvRXh0R1N0YXRlIC9DQSAwLjI1IC9jYSAxID4+Ci9BMyA8PCAvVHlwZSAvRXh0R1N0YXRlIC9DQSAxIC9jYSAxID4+Ci9BNCA8PCAvVHlwZSAvRXh0R1N0YXRlIC9DQSAwLjggL2NhIDAuOCA+PiA+PgplbmRvYmoKNSAwIG9iago8PCA+PgplbmRvYmoKNiAwIG9iago8PCA+PgplbmRvYmoKNyAwIG9iago8PCAvRjEtRGVqYVZ1U2Fucy1taW51cyAzMSAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFsgMTEgMCBSIF0gL0NvdW50IDEgPj4KZW5kb2JqCjQ2IDAgb2JqCjw8IC9DcmVhdG9yIChNYXRwbG90bGliIHYzLjEwLjksIGh0dHBzOi8vbWF0cGxvdGxpYi5vcmcpCi9Qcm9kdWNlciAoTWF0cGxvdGxpYiBwZGYgYmFja2VuZCB2My4xMC45KQovQ3JlYXRpb25EYXRlIChEOjIwMjYxMDE2MTYwMTAyKzAyJzAwJykgPj4KZW5kb2JqCnhyZWYKMCA0NwowMDAwMDAwMDAwIDY1NTM1IGYgCjAwMDAwMDAwMTYgMDAwMDAgbiAKMDAwMDAxNjE1MCAwMDAwMCBuIAowMDAwMDE1ODQzIDAwMDAwIG4gCjAwMDAwMTU4NzUgMDAwMDAgbiAKMDAwMDAxNjA1OSAwMDAwMCBuIAowMDAwMDE2MDgwIDAwMDAwIG4gCjAwMDAwMTYxMDEgMDAwMDAgbiAKMDAwMDAwMDA2NSAwMDAwMCBuIAowMDAwMDAwMzQ3IDAwMDAwIG4gCjAwMDAwMDc2MzEgMDAwMDAgbiAKMDAwMDAwMDIwOCAwMDAwMCBuIAowMDAwMDA3NjEwIDAwMDAwIG4gCjAwMDAwMTQ0MzkgMDAwMDAgbiAKMDAwMDAxNDIzMiAwMDAwMCBuIAowMDAwMDEzNzM1IDAwMDAwIG4gCjAwMDAwMTU0OTIgMDAwMDAgbiAKMDAwMDAwNzY1MSAwMDAwMCBuIAowMDAwMDA3ODA0IDAwMDAwIG4gCjAwMDAwMDc5NTIgMDAwMDAgbiAKMDAwMDAwODEwOCAwMDAwMCBuIAowMDAwMDA4MzUxIDAwMDAwIG4gCjAwMDAwMDg0ODkgMDAwMDAgbiAKMDAwMDAwODg2OSAwMDAwMCBuIAowMDAwMDA5MDE0IDAwMDAwIG4gCjAwMDAwMDkxNTUgMDAwMDAgbiAKMDAwMDAwOTQ3NyAwMDAwMCBuIAowMDAwMDA5Nzk5IDAwMDAwIG4gCjAwMDAwMDk5NjUgMDAwMDAgbiAKMDAwMDAxMDEwOSAwMDAwMCBuIAowMDAwMDEwMjI4IDAwMDAwIG4gCjAwMDAwMTA1NTkgMDAwMDAgbiAKMDAwMDAxMDczMSAwMDAwMCBuIAowMDAwMDEwOTY3IDAwMDAwIG4gCjAwMDAwMTEyNTggMDAwMDAgbiAKMDAwMDAxMTQxMyAwMDAwMCBuIAowMDAwMDExNTM2IDAwMDAwIG4gCjAwMDAwMTE3NjkgMDAwMDAgbiAKMDAwMDAxMTkxMSAwMDAwMCBuIAowMDAwMDEyMzA0IDAwMDAwIG4gCjAwMDAwMTIzOTQgMDAwMDAgbiAKMDAwMDAxMjYwMCAwMDAwMCBuIAowMDAwMDEyOTI0IDAwMDAwIG4gCjAwMDAwMTMwODUgMDAwMDAgbiAKMDAwMDAxMzI5OSAwMDAwMCBuIAowMDAwMDEzNDQ3IDAwMDAwIG4gCjAwMDAwMTYyMTAgMDAwMDAgbiAKdHJhaWxlcgo8PCAvU2l6ZSA0NyAvUm9vdCAxIDAgUiAvSW5mbyA0NiAwIFIgPj4Kc3RhcnR4cmVmCjE2MzY5CiUlRU9GCg==",
+      "text/plain": [
+       "<Figure size 1800x1350 with 1 Axes>"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "#| label: fig-traiettoria\n",
+    "#| fig-cap: Confronto tra traiettoria reale e stimata, ricostruite dal CSV.\n",
+    "#| fig-pos: htbp\n",
+    "fig, ax = plt.subplots(figsize=(6, 4.5), layout=\"constrained\")\n",
+    "ax.plot(df[\"true_x_m\"], df[\"true_y_m\"], color=\"#0072B2\", label=\"Traiettoria reale\")\n",
+    "ax.plot(df[\"estimated_x_m\"], df[\"estimated_y_m\"], \"--\", color=\"#CC79A7\", label=\"Traiettoria EKF\")\n",
+    "ax.scatter(df[\"true_x_m\"].iloc[0], df[\"true_y_m\"].iloc[0], marker=\"o\", color=\"black\", label=\"Partenza\", zorder=3)\n",
+    "ax.set(xlabel=\"x [m]\", ylabel=\"y [m]\")\n",
+    "ax.set_aspect(\"equal\", adjustable=\"datalim\")\n",
+    "ax.grid(alpha=0.25)\n",
+    "ax.legend(fontsize=9)\n",
+    "plt.show()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "4ee12aed",
+   "metadata": {
+    "user_expressions": [
+     {
+      "expression": "static_accepted",
+      "result": {
+       "data": {
+        "text/plain": "2331"
+       },
+       "metadata": {},
+       "status": "ok"
+      }
+     },
+     {
+      "expression": "static_rejected",
+      "result": {
+       "data": {
+        "text/plain": "50"
+       },
+       "metadata": {},
+       "status": "ok"
+      }
+     },
+     {
+      "expression": "static_total",
+      "result": {
+       "data": {
+        "text/plain": "2381"
+       },
+       "metadata": {},
+       "status": "ok"
+      }
+     },
+     {
+      "expression": "dynamic_accepted",
+      "result": {
+       "data": {
+        "text/plain": "0"
+       },
+       "metadata": {},
+       "status": "ok"
+      }
+     },
+     {
+      "expression": "dynamic_rejected",
+      "result": {
+       "data": {
+        "text/plain": "550"
+       },
+       "metadata": {},
+       "status": "ok"
+      }
+     },
+     {
+      "expression": "dynamic_total",
+      "result": {
+       "data": {
+        "text/plain": "550"
+       },
+       "metadata": {},
+       "status": "ok"
+      }
+     },
+     {
+      "expression": "accepted",
+      "result": {
+       "data": {
+        "text/plain": "2331"
+       },
+       "metadata": {},
+       "status": "ok"
+      }
+     },
+     {
+      "expression": "rejected",
+      "result": {
+       "data": {
+        "text/plain": "600"
+       },
+       "metadata": {},
+       "status": "ok"
+      }
+     },
+     {
+      "expression": "accepted + rejected",
+      "result": {
+       "data": {
+        "text/plain": "2931"
+       },
+       "metadata": {},
+       "status": "ok"
+      }
+     },
+     {
+      "expression": "recall_text",
+      "result": {
+       "data": {
+        "text/plain": "'100,00%'"
+       },
+       "metadata": {},
+       "status": "ok"
+      }
+     },
+     {
+      "expression": "precision_text",
+      "result": {
+       "data": {
+        "text/plain": "'91,67%'"
+       },
+       "metadata": {},
+       "status": "ok"
+      }
+     },
+     {
+      "expression": "static_reject_text",
+      "result": {
+       "data": {
+        "text/plain": "'2,10%'"
+       },
+       "metadata": {},
+       "status": "ok"
+      }
+     }
+    ]
+   },
+   "source": [
+    "## Classificazione delle misure\n",
+    "\n",
+    "La provenienza reale delle misure è nota nel simulatore. Le misure generate sono sommate sui fotogrammi; i contatori cumulativi di accettazione e rifiuto vengono invece letti esclusivamente nell’ultima riga, per evitare conteggi ripetuti.\n",
+    "\n",
+    "| Provenienza | Accettata | Scartata | Totale |\n",
+    "|:--|--:|--:|--:|\n",
+    "| Landmark statici | `{python} static_accepted` | `{python} static_rejected` | `{python} static_total` |\n",
+    "| Persone mobili | `{python} dynamic_accepted` | `{python} dynamic_rejected` | `{python} dynamic_total` |\n",
+    "| **Totale** | **`{python} accepted`** | **`{python} rejected`** | **`{python} accepted + rejected`** |\n",
+    "\n",
+    ": Decisioni del sistema distinte per provenienza reale della misura. {#tbl-classificazione}\n",
+    "\n",
+    "I conteggi riguardano misure, non oggetti distinti: la stessa persona o lo stesso landmark può essere osservato ripetutamente. “Accettata” significa ritenuta compatibile con la mappa, non necessariamente proveniente da un oggetto realmente statico.\n",
+    "\n",
+    "| Indicatore | Definizione | Valore |\n",
+    "|:--|:--|--:|\n",
+    "| Rifiuto delle misure dinamiche (recall) | Dinamiche scartate / dinamiche generate | `{python} recall_text` |\n",
+    "| Precisione degli scarti | Dinamiche scartate / tutte le scartate | `{python} precision_text` |\n",
+    "| Rifiuto delle misure statiche | Statiche scartate / statiche generate | `{python} static_reject_text` |"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "id": "f2bec814",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Delle 550 misure provenienti da persone mobili, 550 sono state scartate e 0 sono state accettate nell’EKF. La percentuale di rifiuto delle misure dinamiche è 100,00%.\n",
+      "\n",
+      "Delle 2381 misure statiche, 50 sono state scartate. Questo conteggio quantifica il costo del filtraggio in termini di osservazioni statiche non utilizzate.\n"
+     ]
+    }
+   ],
+   "source": [
+    "#| output: asis\n",
+    "if dynamic_total == 0:\n",
+    "    print(\"Nella sessione non sono state generate misure di persone: non è possibile valutare il rifiuto delle misure dinamiche.\")\n",
+    "else:\n",
+    "    print(f\"Delle {dynamic_total} misure provenienti da persone mobili, {dynamic_rejected} sono state scartate e {dynamic_accepted} sono state accettate nell’EKF. La percentuale di rifiuto delle misure dinamiche è {recall_text}.\")\n",
+    "print(f\"\\nDelle {static_total} misure statiche, {static_rejected} sono state scartate. Questo conteggio quantifica il costo del filtraggio in termini di osservazioni statiche non utilizzate.\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "0349af9f",
+   "metadata": {},
+   "source": [
+    "## Interfaccia interattiva\n",
+    "\n",
+    "I quadrati grigi rappresentano i landmark noti; i contorni verdi indicano i landmark associati alle misure accettate. Le persone sono arancioni, le misure rifiutate sono croci rosse, il robot reale è blu e la stima EKF è rosa. I comandi sono frecce o `WASD` per la guida, spazio per fermarsi, `R` per reimpostare la stima ed `Esc` per salvare uno screenshot e chiudere la finestra."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "id": "66eaff19",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "![Esempio dell’interfaccia interattiva. Lo screenshot è illustrativo e non viene utilizzato per calcolare le metriche.](artifacts/lidar_dynamic_gate_screenshot.png){width=90%}\n"
+     ]
+    }
+   ],
+   "source": [
+    "#| output: asis\n",
+    "screenshot = ARTIFACTS / \"lidar_dynamic_gate_screenshot.png\"\n",
+    "if screenshot.exists():\n",
+    "    print('![Esempio dell’interfaccia interattiva. Lo screenshot è illustrativo e non viene utilizzato per calcolare le metriche.](artifacts/lidar_dynamic_gate_screenshot.png){width=90%}')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "257f5ce3",
+   "metadata": {},
+   "source": [
+    "Lo screenshot ha un nome fisso e non contiene l’identificativo della sessione nel nome: non se ne assume quindi la corrispondenza con il CSV selezionato. I risultati quantitativi e le traiettorie precedenti dipendono esclusivamente dal log analizzato.\n",
+    "\n",
+    "# Discussione e conclusioni"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "id": "1d628da2",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "La sessione analizzata presenta un RMSE di posizione pari a 0,0432 m e un errore finale pari a 0,0271 m. Sono state utilizzate 2331 misure e scartate 600 misure.\n",
+      "\n",
+      "In questa prova tutte le misure delle persone sono state escluse dall’aggiornamento dell’EKF.\n",
+      "\n",
+      "Il rifiuto delle misure statiche è pari a 2,10%. Il risultato deve essere interpretato insieme alla capacità di rifiutare le osservazioni dinamiche, poiché un filtro troppo restrittivo può eliminare anche informazioni utili alla localizzazione.\n"
+     ]
+    }
+   ],
+   "source": [
+    "#| output: asis\n",
+    "print(f\"La sessione analizzata presenta un RMSE di posizione pari a {fmt(rmse)} m e un errore finale pari a {fmt(final_error)} m. Sono state utilizzate {accepted} misure e scartate {rejected} misure.\")\n",
+    "if dynamic_total > 0:\n",
+    "    if dynamic_accepted == 0:\n",
+    "        print(\"\\nIn questa prova tutte le misure delle persone sono state escluse dall’aggiornamento dell’EKF.\")\n",
+    "    else:\n",
+    "        print(f\"\\nIn questa prova {dynamic_accepted} misure delle persone sono state utilizzate nell’EKF: il rifiuto degli oggetti dinamici non è stato completo.\")\n",
+    "print(f\"\\nIl rifiuto delle misure statiche è pari a {static_reject_text}. Il risultato deve essere interpretato insieme alla capacità di rifiutare le osservazioni dinamiche, poiché un filtro troppo restrittivo può eliminare anche informazioni utili alla localizzazione.\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "3130086b",
+   "metadata": {},
+   "source": [
+    "La valutazione documenta il comportamento di una singola sessione simulata; non dimostra superiorità rispetto ad altri metodi né garantisce le stesse prestazioni in qualsiasi ambiente. I principali limiti sono la semplicità del modello del sensore e delle persone, la disponibilità di una mappa nota e la scelta euristica delle soglie.\n",
+    "\n",
+    "La posa vera permette di misurare direttamente l’errore: su un robot reale sarebbe necessario un riferimento indipendente. Il progetto mostra l’integrazione di associazione geometrica, gate adattativo ed EKF in un’interfaccia guidabile, con risultati verificabili tramite log.\n",
+    "\n",
+    "# Estratti dell’implementazione {.appendix}\n",
+    "\n",
+    "I frammenti seguenti vengono generati dal file `interactive_lidar_dynamic_gate.py` presente al momento del render. La logica è quella dello script; commenti e docstring vengono rimossi e la formattazione viene normalizzata. Il file di simulazione non viene eseguito per produrre questi estratti.\n",
+    "\n",
+    "Il log attuale non conserva una copia completa della configurazione o del codice della sessione: questi estratti documentano quindi lo script disponibile, non certificano che una vecchia registrazione sia stata prodotta dalla medesima versione. Dopo modifiche al modello o ai parametri è opportuno registrare una nuova sessione.\n",
+    "\n",
+    "## Configurazione"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "id": "391250fd",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "```python\n",
+      "@dataclass\n",
+      "class ExperimentConfig:\n",
+      "    seed: int = 7\n",
+      "    dt: float = 0.1\n",
+      "    steps: int = 550\n",
+      "    world_size: float = 18.0\n",
+      "    n_landmarks: int = 42\n",
+      "    n_people: int = 6\n",
+      "    lidar_max_range: float = 11.0\n",
+      "    lidar_fov: float = 2.0 * np.pi\n",
+      "    sigma_range: float = 0.12\n",
+      "    sigma_bearing: float = np.deg2rad(1.8)\n",
+      "    process_sigma_xy: float = 0.035\n",
+      "    process_sigma_theta: float = np.deg2rad(1.2)\n",
+      "    base_gate: float = 5.991\n",
+      "    min_gate: float = 3.2\n",
+      "    max_gate: float = 9.5\n",
+      "    gate_speed_gain: float = 0.45\n",
+      "    gate_uncertainty_gain: float = 0.7\n",
+      "    gate_range_tightening: float = 0.025\n",
+      "```\n",
+      "\n",
+      "```python\n",
+      "@dataclass\n",
+      "class InteractiveConfig(ExperimentConfig):\n",
+      "    dt: float = 0.08\n",
+      "    world_size: float = 14.0\n",
+      "    n_landmarks: int = 24\n",
+      "    n_people: int = 4\n",
+      "    lidar_max_range: float = 8.5\n",
+      "    sigma_range: float = 0.06\n",
+      "    sigma_bearing: float = np.deg2rad(1.0)\n",
+      "    relative_motion_gate: float = 0.55\n",
+      "    association_gate: float = 1.1\n",
+      "```\n",
+      "\n"
+     ]
+    }
+   ],
+   "source": [
+    "#| output: asis\n",
+    "show_code(\"ExperimentConfig\")\n",
+    "show_code(\"InteractiveConfig\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "7f5349b5",
+   "metadata": {},
+   "source": [
+    "## Costruzione della mappa e inizializzazione"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "id": "5d55fd89",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "```python\n",
+      "def _make_static_objects(self) -> np.ndarray:\n",
+      "    wall_top = np.column_stack((np.linspace(-10, 10, 9), np.full(9, 9.5)))\n",
+      "    wall_bottom = np.column_stack((np.linspace(-10, 10, 9), np.full(9, -9.5)))\n",
+      "    columns = np.array([[-8, -2], [-4, 3], [0, -1], [5, 4], [8, -4], [2, 7]], dtype=float)\n",
+      "    return np.vstack((wall_top, wall_bottom, columns))\n",
+      "```\n",
+      "\n",
+      "```python\n",
+      "self.robot = np.array([-7.5, -6.0, np.deg2rad(20.0)])\n",
+      "self.people = self.rng.uniform(-0.65 * self.cfg.world_size, 0.65 * self.cfg.world_size, size=(self.cfg.n_people, 2))\n",
+      "self.people_vel = self.rng.normal(0.0, 0.55, size=(self.cfg.n_people, 2))\n",
+      "self.ekf = PoseEKF(initial_state=self.robot + np.array([0.5, -0.35, np.deg2rad(8.0)]), initial_cov=np.diag([0.7, 0.7, np.deg2rad(10.0)]) ** 2, cfg=self.cfg)\n",
+      "```\n",
+      "\n"
+     ]
+    }
+   ],
+   "source": [
+    "#| output: asis\n",
+    "show_code(\"_make_static_objects\", \"InteractiveLidarSimulation\")\n",
+    "node = find_node(\"__init__\", \"InteractiveLidarSimulation\")\n",
+    "wanted = {\"robot\", \"people\", \"people_vel\", \"ekf\"}\n",
+    "print(\"```python\")\n",
+    "for statement in node.body:\n",
+    "    if isinstance(statement, ast.Assign) and any(isinstance(t, ast.Attribute) and t.attr in wanted for t in statement.targets):\n",
+    "        print(ast.unparse(statement))\n",
+    "print(\"```\\n\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "c7208a4b",
+   "metadata": {},
+   "source": [
+    "## Modello cinematico e movimento delle persone"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 9,
+   "id": "30631d43",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "```python\n",
+      "def step_unicycle(state: np.ndarray, control: tuple[float, float], dt: float) -> np.ndarray:\n",
+      "    v, omega = control\n",
+      "    x, y, th = state\n",
+      "    return np.array([x + v * np.cos(th) * dt, y + v * np.sin(th) * dt, wrap_angle(th + omega * dt)])\n",
+      "```\n",
+      "\n",
+      "```python\n",
+      "def _move_people(self) -> None:\n",
+      "    self.people += self.people_vel * self.cfg.dt\n",
+      "    limit = 0.8 * self.cfg.world_size\n",
+      "    for i in range(len(self.people)):\n",
+      "        for axis in range(2):\n",
+      "            if self.people[i, axis] < -limit or self.people[i, axis] > limit:\n",
+      "                self.people_vel[i, axis] *= -1.0\n",
+      "                self.people[i, axis] = np.clip(self.people[i, axis], -limit, limit)\n",
+      "```\n",
+      "\n"
+     ]
+    }
+   ],
+   "source": [
+    "#| output: asis\n",
+    "show_code(\"step_unicycle\")\n",
+    "show_code(\"_move_people\", \"InteractiveLidarSimulation\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "bc96d5b2",
+   "metadata": {},
+   "source": [
+    "## Misure e trasformazioni"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 10,
+   "id": "5bc493f7",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "```python\n",
+      "def relative_xy(robot_state: np.ndarray, world_point: np.ndarray) -> np.ndarray:\n",
+      "    dx = world_point[0] - robot_state[0]\n",
+      "    dy = world_point[1] - robot_state[1]\n",
+      "    c = np.cos(robot_state[2])\n",
+      "    s = np.sin(robot_state[2])\n",
+      "    return np.array([c * dx + s * dy, -s * dx + c * dy])\n",
+      "```\n",
+      "\n",
+      "```python\n",
+      "def relative_to_measurement(rel_xy: np.ndarray, rng: np.random.Generator, cfg: InteractiveConfig) -> np.ndarray:\n",
+      "    r = np.hypot(rel_xy[0], rel_xy[1])\n",
+      "    b = np.arctan2(rel_xy[1], rel_xy[0])\n",
+      "    return np.array([r + rng.normal(0.0, cfg.sigma_range), wrap_angle(b + rng.normal(0.0, cfg.sigma_bearing))])\n",
+      "```\n",
+      "\n",
+      "```python\n",
+      "def measurement_to_relative(z: np.ndarray) -> np.ndarray:\n",
+      "    return np.array([z[0] * np.cos(z[1]), z[0] * np.sin(z[1])])\n",
+      "```\n",
+      "\n",
+      "```python\n",
+      "def measurement_model(self, landmark: np.ndarray) -> tuple[np.ndarray, np.ndarray]:\n",
+      "    dx = landmark[0] - self.x[0]\n",
+      "    dy = landmark[1] - self.x[1]\n",
+      "    q = max(dx * dx + dy * dy, 1e-09)\n",
+      "    r = np.sqrt(q)\n",
+      "    bearing = wrap_angle(np.arctan2(dy, dx) - self.x[2])\n",
+      "    H = np.array([[-dx / r, -dy / r, 0.0], [dy / q, -dx / q, -1.0]])\n",
+      "    return (np.array([r, bearing]), H)\n",
+      "```\n",
+      "\n"
+     ]
+    }
+   ],
+   "source": [
+    "#| output: asis\n",
+    "show_code(\"relative_xy\")\n",
+    "show_code(\"relative_to_measurement\")\n",
+    "show_code(\"measurement_to_relative\")\n",
+    "show_code(\"measurement_model\", \"PoseEKF\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "93499ca3",
+   "metadata": {},
+   "source": [
+    "## Predizione e aggiornamento EKF"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 11,
+   "id": "463da24c",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "```python\n",
+      "def predict(self, control: tuple[float, float]) -> None:\n",
+      "    v, omega = control\n",
+      "    x, y, th = self.x\n",
+      "    dt = self.cfg.dt\n",
+      "    self.x = np.array([x + v * np.cos(th) * dt, y + v * np.sin(th) * dt, wrap_angle(th + omega * dt)])\n",
+      "    F = np.array([[1.0, 0.0, -v * np.sin(th) * dt], [0.0, 1.0, v * np.cos(th) * dt], [0.0, 0.0, 1.0]])\n",
+      "    Q = np.diag([self.cfg.process_sigma_xy ** 2, self.cfg.process_sigma_xy ** 2, self.cfg.process_sigma_theta ** 2])\n",
+      "    self.P = F @ self.P @ F.T + Q\n",
+      "```\n",
+      "\n",
+      "```python\n",
+      "def innovation_distance(self, z: np.ndarray, landmark: np.ndarray, R: np.ndarray) -> tuple[float, np.ndarray]:\n",
+      "    z_hat, H = self.measurement_model(landmark)\n",
+      "    innovation = z - z_hat\n",
+      "    innovation[1] = wrap_angle(innovation[1])\n",
+      "    S = H @ self.P @ H.T + R\n",
+      "    d2 = float(innovation.T @ np.linalg.inv(S) @ innovation)\n",
+      "    return (d2, S)\n",
+      "```\n",
+      "\n",
+      "```python\n",
+      "def update(self, z: np.ndarray, landmark: np.ndarray, R: np.ndarray) -> float:\n",
+      "    z_hat, H = self.measurement_model(landmark)\n",
+      "    innovation = z - z_hat\n",
+      "    innovation[1] = wrap_angle(innovation[1])\n",
+      "    S = H @ self.P @ H.T + R\n",
+      "    K = self.P @ H.T @ np.linalg.inv(S)\n",
+      "    self.x = self.x + K @ innovation\n",
+      "    self.x[2] = wrap_angle(self.x[2])\n",
+      "    I = np.eye(3)\n",
+      "    self.P = (I - K @ H) @ self.P @ (I - K @ H).T + K @ R @ K.T\n",
+      "    return float(innovation.T @ np.linalg.inv(S) @ innovation)\n",
+      "```\n",
+      "\n"
+     ]
+    }
+   ],
+   "source": [
+    "#| output: asis\n",
+    "show_code(\"predict\", \"PoseEKF\")\n",
+    "show_code(\"innovation_distance\", \"PoseEKF\")\n",
+    "show_code(\"update\", \"PoseEKF\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "cd5c0d11",
+   "metadata": {},
+   "source": [
+    "## Associazione e soglia adattativa"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 12,
+   "id": "362163ee",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "```python\n",
+      "def _classify_and_update(self, measurements: list[dict], noisy_control: tuple[float, float]) -> None:\n",
+      "    R = np.diag([self.cfg.sigma_range ** 2, self.cfg.sigma_bearing ** 2])\n",
+      "    accepted_static = []\n",
+      "    dynamic_world = []\n",
+      "    predicted_pose = self.ekf.x.copy()\n",
+      "    for measurement in measurements:\n",
+      "        z = measurement['z']\n",
+      "        observed_rel = measurement_to_relative(z)\n",
+      "        candidates = []\n",
+      "        for i, landmark in enumerate(self.landmarks):\n",
+      "            expected_rel = relative_xy(predicted_pose, landmark)\n",
+      "            rel_error = np.linalg.norm(observed_rel - expected_rel)\n",
+      "            d2, S = self.ekf.innovation_distance(z, landmark, R)\n",
+      "            gate = self._dynamic_motion_gate(S, z[0], abs(noisy_control[0]))\n",
+      "            candidates.append((rel_error, d2, gate, i))\n",
+      "        rel_error, d2, gate, best_idx = min(candidates, key=lambda item: item[0])\n",
+      "        is_static_consistent = rel_error < self.cfg.association_gate and d2 < gate\n",
+      "        if is_static_consistent:\n",
+      "            self.ekf.update(z, self.landmarks[best_idx], R)\n",
+      "            accepted_static.append(self.landmarks[best_idx])\n",
+      "            self.accepted_count += 1\n",
+      "        else:\n",
+      "            dynamic_world.append(self._measurement_world_point(z))\n",
+      "            self.rejected_count += 1\n",
+      "            if measurement['source'] == 'person':\n",
+      "                self.dynamic_count += 1\n",
+      "    self.accepted_static_world = np.array(accepted_static) if accepted_static else np.empty((0, 2))\n",
+      "    self.detected_dynamic = np.array(dynamic_world) if dynamic_world else np.empty((0, 2))\n",
+      "    self.current_gate_static = len(accepted_static)\n",
+      "    self.current_gate_dynamic = len(dynamic_world)\n",
+      "```\n",
+      "\n",
+      "```python\n",
+      "def _dynamic_motion_gate(self, S: np.ndarray, measured_range: float, speed: float) -> float:\n",
+      "    uncertainty = np.sqrt(max(np.linalg.det(S), 0.0))\n",
+      "    threshold = self.cfg.base_gate + self.cfg.gate_uncertainty_gain * uncertainty + self.cfg.gate_speed_gain * speed - self.cfg.gate_range_tightening * measured_range\n",
+      "    return float(np.clip(threshold, self.cfg.min_gate, self.cfg.max_gate))\n",
+      "```\n",
+      "\n"
+     ]
+    }
+   ],
+   "source": [
+    "#| output: asis\n",
+    "show_code(\"_classify_and_update\", \"InteractiveLidarSimulation\")\n",
+    "show_code(\"_dynamic_motion_gate\", \"InteractiveLidarSimulation\")"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3 (ipykernel)",
+   "language": "python",
+   "name": "python3",
+   "path": "C:\\Users\\thoma\\miniconda3\\share\\jupyter\\kernels\\python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.13.12"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
